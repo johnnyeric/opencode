@@ -18,7 +18,7 @@ The product idea that actually runs when you type a prompt is not SessionV2. `Se
 
 A second stack is already growing in the same process. `packages/core` owns SQLite, EventV2, Location, catalog, and `SessionV2`. `POST /api/session/:id/prompt` admits `session_input` and wakes `SessionExecution`. The TUI's main send is `POST /session/:id/message` (`session.prompt`); `prompt_async` exists for a few other UI flows. Both APIs are mounted on one server.
 
-If you are porting Kilo, do not start from this tree's `KiloPlugin`. `packages/core/src/plugin/provider/kilo.ts` only stamps `HTTP-Referer` and `X-Title` onto `https://api.kilo.ai/api/gateway`. It is not a port. This document does not port anything.
+If you are porting Kilo, do not start from this tree's `KiloPlugin`. `packages/core/src/plugin/provider/kilo.ts` only stamps `HTTP-Referer` and `X-Title` onto `https://api.kilo.ai/api/gateway`. The real overlay lives in [Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode) `main`. See [Where Kilo sits on this v1 spine](#where-kilo-sits-on-this-v1-spine).
 
 ## What to ignore on Monday
 
@@ -450,6 +450,124 @@ CLI / Desktop / TUI / App / ACP / SDK
 
 A Kilo product that wants today's OpenCode UX should treat `packages/opencode` as the host and `SessionPrompt.loop` as the loop. A Kilo that wants the inbox/runner should read origin/v2, not this file's SessionV2 sidebar — this tree's SessionV2 is mid-migration (shell/skill/compact still `OperationUnavailableError`). A Kilo that only needs a provider should use a v1 `provider.models` / auth plugin, or the Core catalog transform, not a new process.
 
+## Where Kilo sits on this v1 spine
+
+Not this repo. Public product is [Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode) `main` at `785b0bcdf7ac765dd29016cc7e8f25f66dc473c1` (2026-09-02). It is a **fork of OpenCode v1**, not a plugin dropped onto this tree. `.opencode-version` pins upstream OpenCode `v1.18.13`. Hosted identity, gateway routes, and Cloud Agent live in a second repo, [Kilo-Org/cloud](https://github.com/Kilo-Org/cloud). This section only maps the local overlay.
+
+Kilo's own rule: put additive behavior in kilo-named paths; touch shared OpenCode files only through a narrow seam marked `kilocode_change`. CI (`script/check-opencode-annotations.ts`) enforces that. `packages/kilo-*` never get those markers — they are entirely Kilo-owned.
+
+```text
+VS Code / JetBrains / TUI / kilo run
+        |
+        | HTTP+SSE  (editors spawn kilo serve --port 0)
+        | Worker-RPC fallback  (TUI when no daemon)
+        v
+     packages/opencode   (binary renamed kilo)
+        |
+        +-- shared OpenCode v1 loop
+        |   SessionPrompt.loop, SessionProcessor, AI SDK tools-in-stream
+        |   InstanceState per directory, Effect HttpApi, message/part
+        |
+        +-- overlay: packages/opencode/src/kilocode/
+        |   bootstrap, extra tools, gateway provider, daemon,
+        |   memory, indexing, extra HTTP groups
+        |
+        +-- overlay: packages/kilo-*
+        |   vscode, jetbrains, gateway client, indexing engine,
+        |   memory, telemetry, ui, docs
+        |
+        +-- SQLite kilo.db  (same dual-transcript idea as this tree)
+```
+
+That is the same spine this file already described. Kilo did not replace `SessionPrompt.loop`. It renamed the process, added clients, and injected beside the loop.
+
+### Three overlay kinds
+
+| Kind | Where | What |
+| --- | --- | --- |
+| Kilo-owned packages | `packages/kilo-vscode`, `kilo-jetbrains`, `kilo-gateway`, `kilo-indexing`, `kilo-memory`, `kilo-telemetry`, `kilo-ui`, `kilo-i18n`, `kilo-docs`, `kilo-console` (deprecated), `kilo-sandbox`, `kilo-web-ui` | Whole products. Editors, gateway client, indexing engine. No `kilocode_change` |
+| Overlay directory | `packages/opencode/src/kilocode/` (tests under `packages/opencode/test/kilocode/`) | Kilo source that must run inside the CLI process: extra tools, daemon, bootstrap, session helpers, extra HttpApi groups |
+| Shared-file seams | Existing `packages/opencode/src/**` files that also exist upstream | Tiny imports, route mounts, registry appends, config keys. Marked `kilocode_change`. Upstream merge automation lives in `script/upstream/` |
+
+`packages/opencode` is still `@kilocode/cli`. Same yargs binary, same Worker TUI, same Effect HttpApi. The published name is `kilo`, not `opencode`.
+
+### Process and HTTP
+
+Kilo kept the v1 topologies and added two:
+
+1. **TUI.** Same Worker + `createWorkerFetch` fallback this file already has. When a local daemon is healthy, TUI attaches to that instead.
+2. **`kilo serve`.** Same `Server.listen`. Username defaults to `kilo` (`KILO_SERVER_USERNAME`). Password `KILO_SERVER_PASSWORD`. Directory header is `x-kilo-directory`.
+3. **`kilo daemon`.** New. Detached `kilo serve` child, state in `${Global.Path.state}/daemon.json`. TUI/`kilo run` prefer it. `KILO_NO_DAEMON` opts out.
+4. **Editors.** New. VS Code (`packages/kilo-vscode`) and JetBrains (`packages/kilo-jetbrains`) bundle `bin/kilo` and spawn **one** `kilo serve --port 0` per editor host. Random password. Not the Worker. Not the daemon. Sidebar, tabs, and Agent Manager share that child. Worktrees are extra directory keys on the same process (`directory` on the SDK client → InstanceState).
+
+SDK is still generated from the CLI OpenAPI (`packages/sdk/js`, wrapper `createKiloClient()`). Additive Kilo routes live under `packages/opencode/src/kilocode/server/httpapi/` and inject through a narrow shared seam. Do not look at this tree's Core `KiloPlugin` for that HTTP surface.
+
+### Session loop
+
+Still v1. Prompt writes `message`/`part`, then `SessionPrompt.loop`, AI SDK `tool({ execute })` during `streamText`.
+
+Kilo wraps that loop rather than replacing it:
+
+- `KilocodeBootstrap.init` (`packages/opencode/src/kilocode/bootstrap.ts`) runs after instance boot: watcher, `KiloSessions`, memory lifecycle, optional session-export DB, forked indexing (skipped when `KILO_PLATFORM=vscode` because the extension owns that differently).
+- Extra session helpers live in `packages/opencode/src/kilocode/session/` (compaction chunks, prompt queue, fork, cost, instruction, processor bits). Shared `packages/opencode/src/session/prompt.ts` still exists and is patched with `kilocode_change`.
+- Busy is still process-local `SessionRunState`. Agent Manager concurrency is "many directories, one serve process," not clustered SessionV2.
+
+Kilo `main` also contains `packages/core`, `protocol`, `server`, `sdk-next` — the same hybrid this `dev` tree has. Production editors still hit the v1 `/session/...` server, not origin/v2's inbox.
+
+### Providers
+
+This is the overlay that actually replaces this tree's header-stamp plugin.
+
+| This tree | Kilo `main` |
+| --- | --- |
+| `packages/core/src/plugin/provider/kilo.ts` stamps Referer/X-Title on the gateway URL | `packages/kilo-gateway` is a real client: device-auth plugin, `createKilo()`, profile/balance/catalog, FIM/autocomplete, cloud-session helpers |
+| `Provider` in `packages/opencode/src/provider/provider.ts` has a `kilo:` header map | `packages/opencode/src/kilocode/provider/` plus gateway `loader.ts` resolve tokens, org id, anonymous fallback (`api` key value `anonymous`) |
+| Auth in `auth.json` | Same file, under Kilo data dir. `KiloAuthPlugin` (`packages/kilo-gateway/src/plugin.ts`) is a **v1** `Hooks.auth` plugin: provider id `"kilo"`, device-authorization OAuth method, loader maps api/oauth into `kilocodeToken` / `kilocodeOrganizationId` |
+
+Default outbound headers: `HTTP-Referer: https://kilocode.ai`, `X-Title: Kilo Code` (`packages/opencode/src/kilocode/const.ts`). Direct providers still work. Gateway is the first-party route, not the only route.
+
+### Tools, agents, permissions
+
+`ToolRegistry` stays directory-scoped. Kilo **appends** via `KiloToolRegistry.extra` (`packages/opencode/src/kilocode/tool/registry.ts`). Same hook order: `tool.execute.before` → execute → after → truncate.
+
+Always-on extras (when the corresponding service is up): `kilo_memory_recall`, `kilo_memory_save`, `recall`, `notify_user`, `send_file`. Gated extras: `semantic_search` (after indexing ready), `agent_manager` / `agent_manager_models` (VS Code), `browser_open` (VS Code + broker), `background_process`, `interactive_terminal` (CLI), notebooks, charts, `generate_image`, shared board. `notify_user` / `send_file` only when a remote Kilo session is connected.
+
+Built-in v1 tools are still there (`bash` id, `task` subagent). Kilo also has its own `kilocode/tool/task.ts` and shell helpers.
+
+Agents: upstream `build` / `plan` / `general` / `explore` plus Kilo `scout` (`kilocode/agent/scout.txt`) and review prompts. Modes from legacy Kilo still migrate into agents (`modes-migrator.ts`). `KilocodeSystemPrompt.environment` tells the model to write new agents/commands under `.kilo/`, not `.opencode/` or `.kilocode/`.
+
+Permissions stay last-match v1 (`ask` / `once` / `always` / `reject`). `always` is still process-local unless a given flow writes rules into config. Kilo extras in `kilocode/permission` are helpers (agent-manager, headless, external directory, allow-everything), not origin/v2's SQLite `permission` table.
+
+### Config, paths, storage
+
+Rename of the v1 config merge, not a new engine:
+
+- Files: `kilo.json` / `kilo.jsonc`, also still reads `opencode.json(c)`.
+- Dirs: `.kilo/` (project), `~/.config/kilo/` (global). Legacy `.kilocode/` still migrates.
+- Env: `KILO_CONFIG`, `KILO_CONFIG_CONTENT`, `KILO_CONFIG_DIR`, `KILO_PERMISSION`, `KILO_DB`, `KILO_SERVER_PASSWORD`.
+- Extra merge steps Kilo added on top of this tree's list: legacy Kilo migrations, signed-in org modes, then the same well-known → global → project → managed → MDM chain.
+
+SQLite default is `${Global.Path.data}/kilo.db` (this tree: `opencode.db`). Same WAL / 5s busy timeout idea. Extra stores Kilo bolted on: LanceDB/Qdrant via `packages/kilo-indexing`, memory via `packages/kilo-memory`, `session-export.db` when export is on. Snapshots stay git trees under `<data>/snapshot/`. Session diffs still JSON `session_diff`.
+
+### Editors and Agent Manager
+
+This is the largest piece that is **not** in OpenCode v1.
+
+`packages/kilo-vscode` is an HTTP/SSE client of `kilo serve`, the same role this tree's TUI plays. It is not an execution engine. One `KiloConnectionService` owns one child server. Webviews `postMessage` → host → SDK → CLI → `/global/event` → webview.
+
+Agent Manager is a VS Code tab (`packages/kilo-vscode/src/agent-manager/`), not a second runtime. Parallel sessions = extra worktree directories on the same serve process. State in `.kilo/agent-manager.json`, worktrees under `.kilo/worktrees/`. The CLI learns the worktree through the SDK `directory` field, which is the v1 InstanceState key.
+
+JetBrains is the same pattern with a bundled serve child and a Kotlin client generated from the CLI OpenAPI.
+
+### What this overlay does *not* change
+
+- It does not make `SessionV2.prompt` / `session_input` the product loop.
+- It does not move coding sessions into Cloud Agent. Editors stay on the local CLI. Cloud Agent is hosted work in `Kilo-Org/cloud`.
+- It does not replace v1 Plugin Hooks with Core PluginV2 for the TUI/editor path. Gateway auth is a v1 `auth` hook.
+- It does not make this tree's `KiloPlugin` useful. Ignore `packages/core/src/plugin/provider/kilo.ts` when reading Kilo.
+
+If you are comparing distills: read this file's v1 loop, then Kilo's overlay directories, then PR #1's v2 file. Kilo `main` is v1-plus-overlay. origin/v2 is a different runtime.
+
 ## What changed vs origin/v2 (visible from this tree)
 
 The v2 distill already lists the inverse. From this side:
@@ -476,7 +594,7 @@ The v2 distill already lists the inverse. From this side:
 - `SessionRunState.assertNotBusy` is why revert/summarize fail during a run. Prompt itself joins the runner.
 - Native LLM is opt-in. Default is AI SDK, including tool execution inside the stream.
 - `packages/cli` is not `opencode`. `packages/sdk-next` is not `@opencode-ai/sdk`.
-- Core `KiloPlugin` is a header stamp. Ignore it for a real port.
+- Core `KiloPlugin` is a header stamp. The real Kilo overlay is [Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode) `main` (`packages/opencode/src/kilocode/` + `packages/kilo-*`), still on `SessionPrompt.loop`.
 - `oh-my-opencode` is an external ecosystem name, not code in this repo.
 - `mode` vs `agent`: both exist. `mode` config merges into agents.
 - `task` is the v1 subagent tool. `subagent` is the v2 name. The shell tool id is still `bash`.
@@ -491,12 +609,13 @@ The v2 distill already lists the inverse. From this side:
 In this order:
 
 1. This file, then `docs/v2-architecture.md` on PR #1, section for section.
-2. `packages/opencode/src/cli/cmd/tui.ts` and `cli/tui/worker.ts`. Process topology.
-3. `packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts`. HTTP boundary for the TUI.
-4. `packages/opencode/src/session/prompt.ts` (`prompt`, `run`, `loop`). The live loop.
-5. `packages/opencode/src/session/processor.ts` and `session/tools.ts`. Streaming and in-stream tools.
-6. `packages/opencode/src/session/llm.ts` plus `session/llm/AGENTS.md`. AI SDK vs native.
-7. `packages/opencode/src/agent/agent.ts`, `permission/index.ts`, `plugin/index.ts`, `config/config.ts`.
-8. Only then `packages/core/src/session.ts` → `session/input.ts` → `execution/local.ts` → `runner/llm.ts`, to see the inbox already growing beside the loop you just read.
+2. [Where Kilo sits on this v1 spine](#where-kilo-sits-on-this-v1-spine), then [Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode) `packages/opencode/src/kilocode/` and `packages/kilo-docs/pages/contributing/architecture/`.
+3. `packages/opencode/src/cli/cmd/tui.ts` and `cli/tui/worker.ts`. Process topology.
+4. `packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts`. HTTP boundary for the TUI.
+5. `packages/opencode/src/session/prompt.ts` (`prompt`, `run`, `loop`). The live loop.
+6. `packages/opencode/src/session/processor.ts` and `session/tools.ts`. Streaming and in-stream tools.
+7. `packages/opencode/src/session/llm.ts` plus `session/llm/AGENTS.md`. AI SDK vs native.
+8. `packages/opencode/src/agent/agent.ts`, `permission/index.ts`, `plugin/index.ts`, `config/config.ts`.
+9. Only then `packages/core/src/session.ts` → `session/input.ts` → `execution/local.ts` → `runner/llm.ts`, to see the inbox already growing beside the loop you just read.
 
 If `AGENTS.md` "V2 Session Core" or `specs/v2/session.md` disagree with `SessionPrompt.loop`, the loop is what users hit on this ref.
