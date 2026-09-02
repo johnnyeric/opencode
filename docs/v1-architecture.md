@@ -12,11 +12,11 @@ Do not read `origin/v2` for this document. That branch deleted `packages/opencod
 
 ## Overview
 
-OpenCode v1 on this tree is still a coding-agent monolith with a split TUI. `packages/opencode` owns the yargs CLI, the Worker-hosted server, Hono-replaced-by-Effect HTTP, tools, agents, plugins, and the in-memory session loop. TUI, desktop, ACP, and `opencode run` are HTTP/SSE (or Worker-RPC-as-fetch) clients of that server.
+OpenCode v1 on this tree is still a coding-agent monolith with a split TUI. `packages/opencode` owns the yargs CLI, the Worker-hosted server, Effect HttpApi (Hono is gone), tools, agents, plugins, and the in-memory session loop. TUI, desktop, ACP, and `opencode run` are HTTP/SSE (or Worker-RPC-as-fetch) clients of that server.
 
 The product idea that actually runs when you type a prompt is not SessionV2. `SessionPrompt.prompt` writes a user message into `message` / `part` immediately, then `SessionPrompt.loop` drives an in-memory while-loop. AI SDK `tool({ execute })` runs local tools during `streamText`. The loop reloads Parts and calls the model again until the last assistant finishes without pending tools.
 
-A second stack is already growing in the same process. `packages/core` owns SQLite, EventV2, Location, catalog, and `SessionV2`. `POST /api/session/:id/prompt` admits `session_input` and wakes `SessionExecution`. `POST /session/:id/prompt` (and `prompt_async`, which the TUI uses) still goes through `SessionPrompt`. Both APIs are mounted on one server.
+A second stack is already growing in the same process. `packages/core` owns SQLite, EventV2, Location, catalog, and `SessionV2`. `POST /api/session/:id/prompt` admits `session_input` and wakes `SessionExecution`. The TUI's main send is `POST /session/:id/message` (`session.prompt`); `prompt_async` exists for a few other UI flows. Both APIs are mounted on one server.
 
 If you are porting Kilo, do not start from this tree's `KiloPlugin`. `packages/core/src/plugin/provider/kilo.ts` only stamps `HTTP-Referer` and `X-Title` onto `https://api.kilo.ai/api/gateway`. It is not a port. This document does not port anything.
 
@@ -124,16 +124,16 @@ Auth is Basic. Production username defaults to `opencode` but `OPENCODE_SERVER_U
 
 ```text
 TUI
-  -> SDK session.promptAsync
-    -> POST /session/:id/prompt_async
+  -> SDK session.prompt
+    -> POST /session/:id/message
       -> InstanceContextMiddleware (directory header)
         -> SessionPrompt.prompt
           -> write user message + parts
           -> SessionPrompt.loop          (waits for idle)
-        <- 204 No Content                (prompt_async forks the loop)
+        <- streamed JSON SessionV1.WithParts
 ```
 
-Synchronous `POST /session/:id/prompt` runs the same `SessionPrompt.prompt` and streams one JSON body when the loop exits.
+`POST /session/:id/prompt_async` runs the same `SessionPrompt.prompt` forked and returns 204. The TUI uses it for some secondary flows (session move, workspace create), not the main composer.
 
 ### Request path for SessionV2 (mounted, not the TUI default)
 
@@ -172,7 +172,7 @@ This is the part to internalize. It is the v1 loop.
 - `noReply: true` returns without calling the model.
 - Otherwise `loop({ sessionID })`.
 
-There is no inbox. The prompt is already in the transcript before the model runs. HTTP `prompt_async` returns here only because the handler forks the loop, not because admission is separate.
+There is no inbox. The prompt is already in the transcript before the model runs. The TUI composer waits for `SessionPrompt.loop` to finish. `prompt_async` returns 204 only because the handler forks that same loop, not because admission is separate.
 
 Identity: reusing a session ID loads the existing session. Reusing a message ID is not an idempotent admit. The v1 prompt path generates new message IDs.
 
@@ -300,7 +300,7 @@ Durable v1 model identity on a user message is `{ providerID, modelID, variant? 
 
 ## Tools, permissions, MCP
 
-`ToolRegistry` is directory-scoped (`packages/opencode/src/tool/registry.ts`). Built-ins: read, write, edit, apply_patch, glob, grep, bash (`shell`), webfetch, websearch, question, skill, task, todowrite, lsp, plan_enter/plan_exit, invalid. Experimental `code-mode` is off unless flagged.
+`ToolRegistry` is directory-scoped (`packages/opencode/src/tool/registry.ts`). Built-ins: read, write, edit, apply_patch, glob, grep, bash (tool id stays `"bash"` on this tree; v2 later calls it `shell`), webfetch, websearch, question, skill, task, todowrite, lsp, plan_enter/plan_exit, invalid. Experimental `code-mode` (`execute`) is off unless flagged. Question is gated to app/cli/desktop (or a flag).
 
 A tool is omitted from the model snapshot when `Permission.disabled` sees a deny on pattern `*`. Resource-specific denies still advertise the tool. Execution does the real `Permission.ask`.
 
@@ -320,7 +320,7 @@ Permissions (`packages/opencode/src/permission/index.ts`):
 
 ### Subagents
 
-The `task` tool (`packages/opencode/src/tool/task.ts`), not `subagent`. Creates or resumes a child session. Child gets `parentID`. Foreground waits on nested `SessionPrompt.prompt`. Background returns immediately, `BackgroundJob`, completion later injected onto the parent.
+The `task` tool (`packages/opencode/src/tool/task.ts`), not `subagent`. Creates or resumes a child session. Child gets `parentID`. Foreground waits on nested `SessionPrompt.prompt`. Background (`background=true`) needs `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS`, returns immediately, `BackgroundJob`, completion later injected onto the parent.
 
 Parent and child have different session IDs and different `SessionRunState` runners, so they are concurrent. A fork copies messages and remains a top-level session.
 
@@ -341,13 +341,14 @@ Useful v1 hooks:
 | `chat.message` | Mutate user message/parts before save |
 | `chat.params` / `chat.headers` | Sampling and HTTP headers |
 | `tool.execute.before` / `.after` | Mutate or observe a local tool call |
-| `permission.ask` | Before the UI prompt |
 | `command.execute.before` | Slash commands |
 | `shell.env` | Extra env for bash |
 | `experimental.chat.messages.transform` | Rewrite history before the model |
 | `experimental.chat.system.transform` | Rewrite system prompt |
 | `config` | Mutate loaded config |
 | `event` | Observe GlobalBus-shaped events |
+
+`permission.ask` is declared on the v1 Hooks type and is **not** triggered. Runtime `Permission.ask` publishes `permission.asked` events instead.
 
 Core's Effect plugin SDK (`packages/plugin/src/v2`, `packages/core/src/plugin`) is what `KiloPlugin` and SessionV2 catalog transforms use. V1 config plugins do not automatically become those hooks.
 
@@ -372,7 +373,7 @@ This is not "rebuild the world from the log" for the TUI. The TUI reads `message
 
 JSON files that are still live: `auth.json`, `mcp-auth.json`. Snapshots are Git trees under `<data>/snapshot/<project-id>/`. Shell/tool truncation under `<data>/tool-output/`. Plans under `<data>/plans/`. SDK `createOpencodeServer` uses the CLI disk DB, not `:memory:`.
 
-`packages/opencode/src/storage` JSON layout is leftover. Do not look there for sessions.
+`packages/opencode/src/storage` JSON layout is leftover for transcripts. Revert still writes `session_diff` files there. Do not look there for sessions.
 
 ## Config
 
@@ -387,8 +388,11 @@ Two systems, both live.
 5. `.opencode/` directories (global config dir, ancestors, `OPENCODE_CONFIG_DIR`): nested `opencode.json(c)`, commands, agents, modes, plugin files
 6. `OPENCODE_CONFIG_CONTENT`
 7. Active console org config, if logged in
-8. `OPENCODE_PERMISSION` JSON
-9. `tools` booleans rewritten into `permission`
+8. Managed dir `opencode.json(c)` (`ConfigManaged`)
+9. macOS MDM preferences (highest document merge)
+10. `mode` tables folded into `agent`
+11. `OPENCODE_PERMISSION` JSON
+12. `tools` booleans rewritten into `permission`
 
 `{env:VAR}` and `{file:path}` substitute before parse. `ConfigV2Compat` accepts some v2-shaped fields and reports diagnostics; the running TUI still thinks in v1 names (`plugin` tuples, `tools`, `small_model`, `mode`, `attachment`, `snapshot`).
 
@@ -458,14 +462,14 @@ The v2 distill already lists the inverse. From this side:
 
 **Config.** `tools` booleans, `plugin` tuples, `small_model`, `mode`, `attachment`, `snapshot` are live names. Core can migrate them for SessionV2. TUI still loads v1.
 
-**HTTP.** Effect HttpApi replaced Hono *inside* `packages/opencode`, and a second Protocol API is mounted at `/api`. Generated v2 clients exist. TUI `promptAsync` still hits `/session/:id/prompt_async`.
+**HTTP.** Effect HttpApi replaced Hono *inside* `packages/opencode`, and a second Protocol API is mounted at `/api`. Generated v2 clients exist. TUI `session.prompt` still hits `/session/:id/message`.
 
 **Plugins.** V1 Promise hooks still run. Core Effect plugins also run for catalog/SessionV2. Two SDKs in one repo.
 
 ## Gotchas
 
 - `AGENTS.md` on this tree describes SessionV2 as the session core. The TUI does not use it. Trust `SessionHttpApi.prompt` / `promptAsync`.
-- `/session/:id/prompt` and `/api/session/:id/prompt` are different loops that share a `session` row. Do not mix clients casually.
+- `/session/:id/message` (and `prompt_async`) vs `/api/session/:id/prompt` are different loops that share a `session` row. Do not mix clients casually.
 - Worker TUI is not an in-process function call. It is RPC-to-`fetch` into the same Effect handler graph.
 - `opencode serve` without a password is unsecured. Username is not hardcoded.
 - `always` permission does not survive restart on the TUI path.
@@ -475,7 +479,8 @@ The v2 distill already lists the inverse. From this side:
 - Core `KiloPlugin` is a header stamp. Ignore it for a real port.
 - `oh-my-opencode` is an external ecosystem name, not code in this repo.
 - `mode` vs `agent`: both exist. `mode` config merges into agents.
-- `task` is the v1 subagent tool. `subagent` is the v2 name.
+- `task` is the v1 subagent tool. `subagent` is the v2 name. The shell tool id is still `bash`.
+- The TUI composer posts `/session/:id/message`, not `/session/:id/prompt` and not `/api/session/:id/prompt`.
 - Config `instructions` reach the TUI model. Nested AGENTS.md via `read` also exists here.
 - `CLAUDE.md` is loaded unless disabled.
 - EventV2 `owner_id` is replay ownership, not session execution claims. V1 has no execution claim.
